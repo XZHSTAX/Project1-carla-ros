@@ -12,9 +12,10 @@ from pygame.locals import *
 from project1.MPC import MPCPlusPID
 import rclpy
 from rclpy.node import Node
-# from ros_g29_force_feedback.msg import ForceFeedback
-from threading import Thread, Lock, Event
-
+from ros_g29_force_feedback.msg import ForceFeedback
+from std_msgs.msg import Float64
+import threading
+from threading import Thread
 color_bar = [(0,   255,  0 , 0),   # Green  LEFT
              (255, 0,    0 , 0),   # Red    RIGHT
              (0,   0,   0  , 0),   # Black  STRAIGHT
@@ -38,8 +39,8 @@ ct_point = carla.Location(-82.68668,4.825,0)
 class MainNode(Node):
     def __init__(self,world):
         super(MainNode, self).__init__("MainNode")
-        # self.publisher = self.create_publisher(ForceFeedback,"/ff_target", 10)
-
+        self.publisher = self.create_publisher(ForceFeedback,"/ff_target", 10)
+        self.subscriber = self.create_subscription(Float64,"external_torque",self.listener_callback,10)
         self.world = world
         self.clock = pygame.time.Clock()
         self.controller_human = Control_with_G29()
@@ -56,10 +57,7 @@ class MainNode(Node):
         self.plan_count = 0
         self.reach_ct_point = 0
         self.shared_control_transform = 0
-
-        self.main_loop_thread = Thread(
-            target=self.main_loop)
-        self.main_loop_thread.start()
+        self.external_torque = 0
 
     def prepare_wold(self):
         self.actor_list = []
@@ -96,7 +94,6 @@ class MainNode(Node):
 
     def main_loop(self):
         with CarlaSyncMode(self.world, *self.sensors,fps=FPS) as sync_mode: 
-            # while not self.shutdown.is_set() and roscomp.ok():
             while rclpy.ok():
                 self.clock.tick() 
                 tick_response = sync_mode.tick(timeout=2.0)
@@ -111,12 +108,19 @@ class MainNode(Node):
                     return
                 
                 if self.controller_human._autopilot_enabled:
+                    # 如果使用自动驾驶
                     if self.plan_count%plan_fre == 0:
                         traj_object = waypoint2traj(self.route,self.vehicle,transform2vehicle=1,contain_yaw=1)
                         throttle, steer = self.controller_machine.get_control(self.traj,traj_object, speed, desired_speed=15, dt=mpc_sample_time,state = state)
                     self.plan_count = self.plan_count + 1
                     send_control(self.vehicle,throttle,steer,0)
+                    out_msg = ForceFeedback()
+                    out_msg.position = np.clip(steer, -1.0, 1.0)
+                    out_msg.torque = 0.8
+                    self.publisher.publish(out_msg)
+
                 elif self.shared_control_transform:
+                    # 如果开启平滑过度模式
                     #TODO: 在此处添加平滑过度逻辑,这里先写一个简单的线性分配：
                     aplha = 0.5
                     if self.plan_count%plan_fre == 0:
@@ -128,7 +132,7 @@ class MainNode(Node):
                                         self.controller_human._control.brake,
                                         self.controller_human._control.hand_brake,
                                         self.controller_human._control.reverse)                     
-                else:
+                else:# 手动控制
                     send_control(self.vehicle,self.controller_human._control.throttle,
                                         self.controller_human._control.steer,
                                         self.controller_human._control.brake,
@@ -145,7 +149,8 @@ class MainNode(Node):
                          "FPS (simulated):           % 3.0f "%fps,
                          "speed (m/s):               % 3.0f" %speed,
                          'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (self.vehicle.get_transform().location.x, self.vehicle.get_transform().location.y)),
-                         'Yaw:                       % 3.0f' %self.vehicle.get_transform().rotation.yaw
+                         'Yaw:                       % 3.0f' %self.vehicle.get_transform().rotation.yaw,
+                         'external toqure(N·m):      % 3.2f'%self.external_torque,
                         ]                
                 display_info(self.display,texts,self.font,self.vehicle,speed,self.font_speed,self.controller_human._autopilot_enabled,dy=18)
                                 
@@ -156,7 +161,15 @@ class MainNode(Node):
                         self.reach_ct_point = 1
                         self.shared_control_transform = 0
                 if reach_destination(self.vehicle,self.destination):
-                    self.controller_human.autopilot_on = 0        
+                    self.controller_human.autopilot_on = 0 
+        
+    def listener_callback(self,msg):
+        # with self.data_lock:
+        self.external_torque = msg.data
+        # rclpy.logging.get_logger("default").info('hello',once=True)
+    def spin(self):
+            rclpy.spin(self, self.executor)
+
 
 class Control_with_G29(object):
     '''
@@ -179,8 +192,8 @@ class Control_with_G29(object):
             raise ValueError("Please Connect Just One Joystick")
 
         self._joystick = pygame.joystick.Joystick(0)
-        self._joystick.init()
-
+        self._joystick.init()    # rclpy.init(args=args)
+ 
         self._parser = ConfigParser()
         self._parser.read('src/project1/project1/wheel_config.ini')
         self._steer_idx     = int( self._parser.get( 'G29 Racing Wheel', 'steering_wheel' ) )
@@ -406,152 +419,26 @@ def reach_destination(vehicle,destination,radius=5):
         return True
     return False
 
-
-def main():
-    pygame.init()
-    display = pygame.display.set_mode(
-        main_image_shape,
-        pygame.HWSURFACE | pygame.DOUBLEBUF)    # 创建游戏窗口
-    font = pygame.font.SysFont('ubuntumono', 14) # 设置字体
-    font_speed = pygame.font.SysFont('ubuntumono', 100) # 设置字体
-    clock = pygame.time.Clock()   
-
-
-    actor_list = []
+def main(args=None):
     client = carla.Client('localhost', 2000)
     client.set_timeout(80.0)
     client.load_world('Town04')
     world = client.get_world()
-    controller_human = Control_with_G29()
-    controller_machine = MPCPlusPID()
+        
     try:
-        m = world.get_map()
+        rclpy.init(args=args)
+        main_node = MainNode(world)
+        executor = rclpy.executors.MultiThreadedExecutor()
+        executor.add_node(main_node)
 
-        blueprint_library = world.get_blueprint_library()
-
-        veh_bp = random.choice(blueprint_library.filter('vehicle.audi.tt'))  # 选择车辆
-        veh_bp.set_attribute('color','64,81,181')                            # 上色
-        veh_bp.set_attribute('role_name', 'hero')
-        vehicle = world.spawn_actor(                                         # 生成车辆
-            veh_bp,
-            m.get_spawn_points()[56])                                        # 车辆位置选择为生成点[90]
-        actor_list.append(vehicle)
-
-        # 相机输出的画面大小
-        camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x',str(main_image_shape[0]))
-        camera_bp.set_attribute('image_size_y',str(main_image_shape[1]))
-
-        # visualization cam (no functionality)
-        camera_rgb = world.spawn_actor(
-                                    camera_bp,
-                                    carla.Transform(carla.Location(*driver_view[0]), carla.Rotation(*driver_view[1])),
-                                    attach_to=vehicle)
-        
-        actor_list.append(camera_rgb)
-        sensors = [camera_rgb]
-        
-        # 绘制auto规划路点
-        destination = m.get_spawn_points()[294].location
-        route,agent = autopilot(vehicle,destination) # 注意，这里我修改了carla的源码，才使得autopilot能返回路点
-        draw_waypoint(route,world)
-        traj = waypoint2traj(route,vehicle,transform2vehicle=0,contain_yaw=1)
-        
-
-        # 放置观测者
-        spectator = world.get_spectator()
-        transform = vehicle.get_transform()
-        spectator.set_transform(carla.Transform(transform.location + carla.Location(z=20),
-                                                            carla.Rotation(pitch=-90)))
-
-        plan_count = 0
-        reach_ct_point = 0
-        shared_control_transform = 0
-        with CarlaSyncMode(world, *sensors,fps=FPS) as sync_mode: 
-            while True:
-                clock.tick() 
-                tick_response = sync_mode.tick(timeout=2.0)
-                speed = np.linalg.norm( carla_vec_to_np_array(vehicle.get_velocity()))
-                state = [vehicle.get_transform().location.x, 
-                         vehicle.get_transform().location.y, 
-                         vehicle.get_transform().rotation.yaw,
-                         speed,
-                         0.5*(vehicle.get_wheel_steer_angle(carla.VehicleWheelLocation.FR_Wheel)+vehicle.get_wheel_steer_angle(carla.VehicleWheelLocation.FL_Wheel))]
-
-                if controller_human.parse_events(agent,destination): # 如果按下esc键，则直接退出
-                    return
-                
-                if controller_human._autopilot_enabled:
-                    if plan_count%plan_fre == 0:
-                        traj_object = waypoint2traj(route,vehicle,transform2vehicle=1,contain_yaw=1)
-                        throttle, steer = controller_machine.get_control(traj,traj_object, speed, desired_speed=15, dt=mpc_sample_time,state = state)
-                    plan_count = plan_count + 1
-                    send_control(vehicle,throttle,steer,0)
-                elif shared_control_transform:
-                    #TODO: 在此处添加平滑过度逻辑,这里先写一个简单的线性分配：
-                    aplha = 0.5
-                    if plan_count%plan_fre == 0:
-                        traj_object = waypoint2traj(route,vehicle,transform2vehicle=1,contain_yaw=1)
-                        throttle, steer = controller_machine.get_control(traj,traj_object, speed, desired_speed=15, dt=mpc_sample_time,state = state)
-                    plan_count = plan_count + 1
-                    send_control(vehicle,aplha * controller_human._control.throttle + (1- aplha)*throttle,
-                                        aplha * controller_human._control.steer + (1- aplha)*steer,
-                                        controller_human._control.brake,
-                                        controller_human._control.hand_brake,
-                                        controller_human._control.reverse)                     
-                else:
-                    send_control(vehicle,controller_human._control.throttle,
-                                        controller_human._control.steer,
-                                        controller_human._control.brake,
-                                        controller_human._control.hand_brake,
-                                        controller_human._control.reverse) 
-                
-                snapshot, image_rgb = tick_response
-                image_rgb = copy.copy(carla_img_to_array(image_rgb))
-                draw_image_np(display, image_rgb)                   # 在Pygame显示中绘制图像
-                
-                fps = round(1.0 / snapshot.timestamp.delta_seconds)
-                
-                texts = ["FPS (real):                % 3.0f "%int(clock.get_fps()),
-                         "FPS (simulated):           % 3.0f "%fps,
-                         "speed (m/s):               % 3.0f" %speed,
-                         'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (vehicle.get_transform().location.x, vehicle.get_transform().location.y)),
-                         'Yaw:                       % 3.0f' %vehicle.get_transform().rotation.yaw
-                        ]                
-                display_info(display,texts,font,vehicle,speed,font_speed,controller_human._autopilot_enabled,dy=18)
-                                
-                # 如果到达接管触发点，则结束完全自动驾驶，开启
-                if not reach_ct_point:
-                    if reach_destination(vehicle,ct_point,radius=1):
-                        controller_human.autopilot_on = 0
-                        reach_ct_point = 1
-                        shared_control_transform = 0
-                if reach_destination(vehicle,destination):
-                    controller_human.autopilot_on = 0
-    finally:
-        print('destroying actors.')
-        for actor in actor_list:
-            actor.destroy()
-        pygame.quit()
-        print('done.')
-    
-def main_new(args=None):
-    client = carla.Client('localhost', 2000)
-    client.set_timeout(80.0)
-    client.load_world('Town04')
-    world = client.get_world()
-    
-    rclpy.init(args=args)
-    executor = rclpy.executors.MultiThreadedExecutor()
-    main_node = MainNode(world)
-    executor.add_node(main_node)
-
-    try:
-        rclpy.spin(main_node)
+        spin_thread = Thread(target=main_node.spin)
+        spin_thread.start()
+        main_node.main_loop()
     finally:
         print('destroying actors.')
         for actor in main_node.actor_list:
             actor.destroy()
+        spin_thread.join()
         pygame.quit()
         main_node.destroy_node()
         rclpy.shutdown()    
