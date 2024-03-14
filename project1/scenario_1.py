@@ -161,12 +161,12 @@ class MainNode(Node):
                                 
                 # 如果到达接管触发点，则结束完全自动驾驶，开启
                 if not self.reach_ct_point:
-                    if reach_destination(self.vehicle,ct_point,radius=1):
-                        self.controller_human.autopilot_on = 0
+                    if reach_destination(self.vehicle,ct_point,radius=2):
+                        self.controller_human._autopilot_enabled = 0
                         self.reach_ct_point = 1
                         self.shared_control_transform = 0
                 if reach_destination(self.vehicle,self.destination):
-                    self.controller_human.autopilot_on = 0 
+                    self.controller_human._autopilot_enabled = 0 
         
     def listener_callback(self,msg):
         external_torque_filted = self.LowPassFilter_for_ex_torque.filter(msg.data)
