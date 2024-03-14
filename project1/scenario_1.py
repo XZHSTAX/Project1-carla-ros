@@ -16,6 +16,8 @@ from ros_g29_force_feedback.msg import ForceFeedback
 from std_msgs.msg import Float64
 import threading
 from threading import Thread
+from scipy.signal import butter, lfilter
+
 color_bar = [(0,   255,  0 , 0),   # Green  LEFT
              (255, 0,    0 , 0),   # Red    RIGHT
              (0,   0,   0  , 0),   # Black  STRAIGHT
@@ -58,6 +60,9 @@ class MainNode(Node):
         self.reach_ct_point = 0
         self.shared_control_transform = 0
         self.external_torque = 0
+        fs = 1/0.002
+        cutoff_freq = 15
+        self.LowPassFilter_for_ex_torque =  LowPassFilter(cutoff_freq,fs)
 
     def prepare_wold(self):
         self.actor_list = []
@@ -111,7 +116,7 @@ class MainNode(Node):
                     # 如果使用自动驾驶
                     if self.plan_count%plan_fre == 0:
                         traj_object = waypoint2traj(self.route,self.vehicle,transform2vehicle=1,contain_yaw=1)
-                        throttle, steer = self.controller_machine.get_control(self.traj,traj_object, speed, desired_speed=15, dt=mpc_sample_time,state = state)
+                        throttle, steer = self.controller_machine.get_control(self.traj,traj_object, desired_speed=15, dt=mpc_sample_time,state = state)
                     self.plan_count = self.plan_count + 1
                     send_control(self.vehicle,throttle,steer,0)
                     out_msg = ForceFeedback()
@@ -125,7 +130,7 @@ class MainNode(Node):
                     aplha = 0.5
                     if self.plan_count%plan_fre == 0:
                         traj_object = waypoint2traj(self.route,self.vehicle,transform2vehicle=1,contain_yaw=1)
-                        throttle, steer = self.controller_machine.get_control(self.traj,traj_object, speed, desired_speed=15, dt=mpc_sample_time,state = state)
+                        throttle, steer = self.controller_machine.get_control(self.traj,traj_object, desired_speed=15, dt=mpc_sample_time,state = state)
                     self.plan_count = self.plan_count + 1
                     send_control(self.vehicle,aplha * self.controller_human._control.throttle + (1- aplha)*throttle,
                                         aplha * self.controller_human._control.steer + (1- aplha)*steer,
@@ -150,7 +155,7 @@ class MainNode(Node):
                          "speed (m/s):               % 3.0f" %speed,
                          'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (self.vehicle.get_transform().location.x, self.vehicle.get_transform().location.y)),
                          'Yaw:                       % 3.0f' %self.vehicle.get_transform().rotation.yaw,
-                         'external toqure(N·m):      % 3.2f'%self.external_torque,
+                         'external toqure(N·m):      % 3.1f'%self.external_torque,
                         ]                
                 display_info(self.display,texts,self.font,self.vehicle,speed,self.font_speed,self.controller_human._autopilot_enabled,dy=18)
                                 
@@ -164,9 +169,9 @@ class MainNode(Node):
                     self.controller_human.autopilot_on = 0 
         
     def listener_callback(self,msg):
-        # with self.data_lock:
-        self.external_torque = msg.data
-        # rclpy.logging.get_logger("default").info('hello',once=True)
+        external_torque_filted = self.LowPassFilter_for_ex_torque.filter(msg.data)
+        self.external_torque = external_torque_filted
+
     def spin(self):
             rclpy.spin(self, self.executor)
 
@@ -266,6 +271,18 @@ class Control_with_G29(object):
 
         self._control.hand_brake = bool(jsButtons[self._handbrake_idx])
 
+class LowPassFilter:
+    def __init__(self, cutoff_freq, sampling_freq, num_taps=5):
+        self.cutoff_freq = cutoff_freq
+        self.sampling_freq = sampling_freq
+        self.b, self.a = butter(num_taps, 2 * cutoff_freq / sampling_freq, 'low', analog=False)
+        self.buffer = []
+
+    def filter(self, new_data):
+        self.buffer.append(new_data)
+        filtered_data = lfilter(self.b, self.a, self.buffer)[-1]
+        return filtered_data
+    
 def autopilot(vehicle,destination):
     # 输入对应车辆，目的地，返回路径点，控制等
     agent = BehaviorAgent(vehicle)

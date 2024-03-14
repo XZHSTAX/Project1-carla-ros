@@ -212,7 +212,7 @@ class MPC:
                     Theta_row.append(tilde_C @ np.linalg.matrix_power(tilde_A, j - k) @ tilde_B)
                     # Theta_row.append(np.dot(np.dot(tilde_C, np.linalg.matrix_power(tilde_A, j - k)), tilde_B))
                 else:
-                    Theta_row.append(np.zeros((Nx, Nu), dtype=np.float))
+                    Theta_row.append(np.zeros((Nx, Nu)))
             Theta.append(Theta_row)
 
         Theta = np.reshape(np.array(Theta),(Np * Nx,Nc * Nu))
@@ -329,7 +329,8 @@ class MPCPlusPID:
         self.MPC = MPC
         self.pid = pid
 
-    def get_control(self,waypoints_world,waypoints_object,speed, desired_speed, dt,state):
+    def get_control(self,waypoints_world,waypoints_object, desired_speed, dt,state):
+        speed = state[3]
         mpc_desire_speed,steer = self.MPC.get_control(waypoints_world,waypoints_object,speed,state,desired_speed,dt)
         self.pid.set_point = mpc_desire_speed
         a = self.pid.get_control(speed,dt)
