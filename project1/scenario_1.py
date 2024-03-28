@@ -21,6 +21,7 @@ from scipy.signal import butter, lfilter
 from project1.smooth_transition import smooth_transition
 from collections import deque
 import csv
+import time
 color_bar = [(0,   255,  0 , 0),   # Green  LEFT
              (255, 0,    0 , 0),   # Red    RIGHT
              (0,   0,   0  , 0),   # Black  STRAIGHT
@@ -40,6 +41,7 @@ driver_sim_view3 = [[-5.5, 0,     2.8], [-10,0,0]]  # 模拟视角，后看视�
 
 driver_view = driver_sim_view3
 
+use_HSC_mode = 0
 ct_point = carla.Location(-82.68668,4.825,0)
 
 class MainNode(Node):
@@ -47,6 +49,7 @@ class MainNode(Node):
         super(MainNode, self).__init__("MainNode")
         self.publisher = self.create_publisher(ForceFeedback,"/ff_target", 10)
         self.subscriber = self.create_subscription(Float64,"external_torque",self.listener_callback,10)
+        self.subscriber_machine_torque = self.create_subscription(Float64,"machine_torque",self.listener_callback2,10)
         self.world = world
         self.clock = pygame.time.Clock()
         self.controller_human = Control_with_G29()
@@ -92,6 +95,10 @@ class MainNode(Node):
         self.old_speed = deque(maxlen=50)
         self.steering_angle_machine = 0
         self.Manual_Auto_HSC = 0
+        self.machine_torque = 0.0
+        self.record_time = time.time()
+        self.common_takeover = 0
+
 
     def prepare_wold(self):
         self.actor_list = []
@@ -166,7 +173,7 @@ class MainNode(Node):
                     # 如果开启平滑过度模式
                     self.alpha,self.HM_state,self.delta_speed = self.HSC.coorinator(speed,
                                                                     self.external_torque,
-                                                                    out_msg.torque,
+                                                                    self.machine_torque,
                                                                     self.steering_angle_machine,
                                                                     self.controller_human._control.steer)
                     self.desired_speed = self.desired_speed - self.delta_speed
@@ -196,12 +203,29 @@ class MainNode(Node):
                         self.shared_control_transform = 0 
                     self.Manual_Auto_HSC = 2                    
                 
+                elif self.common_takeover:
+                    self.traj = waypoint2traj(self.route,self.vehicle)
+                    throttle, self.steering_angle_machine = self.controller_machine2.get_control(self.traj,speed,desired_speed=self.desired_speed,dt=1./FPS)
+                    if self.controller_human.human_intervent:
+                        send_control(self.vehicle,self.controller_human._control.throttle,
+                                            self.controller_human._control.steer,
+                                            self.controller_human._control.brake,
+                                            self.controller_human._control.hand_brake,
+                                            self.controller_human._control.reverse,throttle_limit = 0.5)
+                        out_msg = ForceFeedback()
+                        out_msg.position = 0.0
+                        out_msg.torque = 0.3
+                        self.publisher.publish(out_msg)
+                    else:
+                        send_control(self.vehicle,throttle,self.steering_angle_machine,0)
+
+
                 else:# 手动控制
                     send_control(self.vehicle,self.controller_human._control.throttle,
                                         self.controller_human._control.steer,
                                         self.controller_human._control.brake,
                                         self.controller_human._control.hand_brake,
-                                        self.controller_human._control.reverse)
+                                        self.controller_human._control.reverse,throttle_limit = 0.5)
                     out_msg = ForceFeedback()
                     out_msg.position = 0.0
                     out_msg.torque = 0.3
@@ -219,33 +243,44 @@ class MainNode(Node):
                          "speed (m/s):               % 3.0f" %speed,
                          'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (self.vehicle.get_transform().location.x, self.vehicle.get_transform().location.y)),
                          'Yaw:                       % 3.0f' %self.vehicle.get_transform().rotation.yaw,
-                         'external toqure(N·m):      % 3.1f'%self.external_torque,
+                         'external torque(N·m):      % 3.1f'%self.external_torque,
+                         'machine torque(N·m):       % 3.1f'%self.machine_torque,
                          'Alpha:                     % 3.1f'%self.alpha,
                          'delta speed:               % 3.1f'%self.delta_speed,
-                         'desired speed:             % 3.1f'%self.desired_speed,
+                         'desired speed:             % 2.1f'%self.desired_speed,
                         ]                
                 self.display_info(self.display,texts,self.font,self.vehicle,speed,self.font_speed)
                                 
                 # 如果到达接管触发点，则结束完全自动驾驶，开启
                 if not self.reach_ct_point:
                     if reach_destination(self.vehicle,ct_point,radius=2):
-                        self.controller_human._autopilot_enabled = 0
-                        self.reach_ct_point = 1
-                        self.shared_control_transform = 1
+                        if use_HSC_mode:
+                            self.controller_human._autopilot_enabled = 0
+                            self.reach_ct_point = 1
+                            self.shared_control_transform = 1
+                        else:
+                            self.reach_ct_point = 1
+                            self.common_takeover = 1
+                            self.controller_human._autopilot_enabled = 0
                 if reach_destination(self.vehicle,self.destination):
                     self.controller_human._autopilot_enabled = 0
-                self.record_data([state[0], # X
-                                  state[1], # Y
-                                  state[2], # Yaw
-                                  state[3], # Speed
-                                  666,                                   # Torque_machine
-                                  self.external_torque,                  # Torque_human
-                                  self.steering_angle_machine,           # Steering_angle_machine
-                                  self.controller_human._control.steer,  # Steering_angle_real
-                                  self.HM_state,                         # HM_state
-                                  666,                                   # Time
-                                  self.alpha,
-                                  self.Manual_Auto_HSC]) 
+                
+                if self.controller_human.start_to_record:
+                    time_now = time.time()
+                    time_passed = time_now - self.record_time
+                    self.record_time = time_now
+                    self.record_data([state[0], # X
+                                    state[1], # Y
+                                    state[2], # Yaw
+                                    state[3], # Speed
+                                    self.machine_torque,                   # Torque_machine
+                                    self.external_torque,                  # Torque_human
+                                    self.steering_angle_machine,           # Steering_angle_machine
+                                    self.controller_human._control.steer,  # Steering_angle_real
+                                    self.HM_state,                         # HM_state
+                                    time_passed,                                   # Time
+                                    self.alpha,
+                                    self.Manual_Auto_HSC]) 
                 
 
     def write_text(self,text,font,display,text_color=(255,0,0),text_location=None):
@@ -269,7 +304,7 @@ class MainNode(Node):
         pygame.draw.rect(display, progress_color, rect)        
 
     def display_info(self,display,texts,font,vehicle,speed,font_speed,dy=18):
-        info_surface = pygame.Surface((220, main_image_shape[1]/2))
+        info_surface = pygame.Surface((220, main_image_shape[1]/3))
         info_surface.set_alpha(100)
         display.blit(info_surface, (0, 0))    
         
@@ -278,9 +313,10 @@ class MainNode(Node):
                 font.render(t, True, (255,255,255)), (5, 20+dy*it))
         v_offset =  20+dy*it + dy
 
+        throttle_rate = vehicle.get_control().throttle
         display.blit( font.render("Throttle:", True, (255,255,255)), (5, v_offset))
         # throttle_rate = np.clip(throttle, 0.0, 1.0)
-        throttle_rate = vehicle.get_control().throttle
+        
         bar_width = 106
         bar_h_offset = 100
         self.draw_progress_bar(display,
@@ -292,6 +328,15 @@ class MainNode(Node):
         #---------------------------------------------------------------------------------#
         display.blit( font.render("Steer:", True, (255,255,255)), (5, v_offset))
         # steer_rate = np.clip(steer, -1.0, 1.0)
+        G29_steer_rate = self.controller_human._control.steer
+        self.draw_progress_bar(display,
+                               ((bar_h_offset+(G29_steer_rate+1)/2*bar_width), v_offset+6),
+                               (6, 6),
+                               ((bar_h_offset+(G29_steer_rate+1)/2*bar_width), v_offset+6),
+                               (5, 5),
+                               frame_color=(0,0,0),
+                               progress_color=(255,0,0))        
+        
         steer_rate = vehicle.get_control().steer
         self.draw_progress_bar(display,
                                (bar_h_offset, v_offset+6),
@@ -299,6 +344,17 @@ class MainNode(Node):
                                ((bar_h_offset+(steer_rate+1)/2*bar_width), v_offset+6),
                                (6, 6))
         v_offset = v_offset + dy
+        #----------------------------------------------------------------------------#
+        display.blit( font.render("REC:", True, (255,0,0)), (5, v_offset))
+        steer_rate = vehicle.get_control().steer
+        self.draw_progress_bar(display,
+                               (bar_h_offset+bar_width, v_offset+6),
+                               (6, 6),
+                               ((bar_h_offset+bar_width), v_offset+6),
+                               (6, 6),
+                               progress_color = (255,0,0) if self.controller_human.start_to_record else (0,0,0))
+        v_offset = v_offset + dy
+
 
         if all(speed > x for x in self.old_speed):
             Speed_color = (255, 105, 105)
@@ -336,6 +392,9 @@ class MainNode(Node):
     def listener_callback(self,msg):
         external_torque_filted = self.LowPassFilter_for_ex_torque.filter(msg.data)
         self.external_torque = external_torque_filted
+
+    def listener_callback2(self,msg):
+        self.machine_torque = msg.data
 
     def spin(self):
             rclpy.spin(self, self.executor)
@@ -385,6 +444,9 @@ class Control_with_G29(object):
         self._brake_idx     = int( self._parser.get( 'G29 Racing Wheel', 'brake' ) )
         self._reverse_idx   = int( self._parser.get( 'G29 Racing Wheel', 'reverse' ) )
         self._handbrake_idx = int( self._parser.get( 'G29 Racing Wheel', 'handbrake' ) )
+
+        self.start_to_record = 0
+        self.human_intervent = 0
     
     def parse_events(self,agent,destination):
         for event in pygame.event.get():
@@ -392,17 +454,23 @@ class Control_with_G29(object):
                 if event.button == 23:
                     self._autopilot_enabled = not self._autopilot_enabled
                     # 如果重新开启了自动驾驶，则重新设定目标路线，重新规划
+                    self.start_to_record = 1  # 开始记录数据
                     if self._autopilot_enabled:
                         agent.set_destination(destination)
                 if event.button == 0:     # 如果按下 "X" 键，则结束      
+                    self.start_to_record = 0 # 停止记录数据
                     return True
                 elif event.button == 4:
                     self._control.gear = 1 if self._control.reverse else -1
+                elif event.button == 2:
+                    self.human_intervent = 1
 
             elif event.type == pygame.KEYDOWN:
                 if event.type == pygame.QUIT:
+                    self.start_to_record = 0 # 停止记录数据
                     return True
                 elif event.key == pygame.K_ESCAPE:
+                    self.start_to_record = 0 # 停止记录数据
                     return True
                 elif event.key == K_p:
                     self._autopilot_enabled = not self._autopilot_enabled
@@ -492,8 +560,8 @@ def carla_vec_to_np_array(vec):
                      vec.z])
 
 def send_control(vehicle, throttle, steer, brake,
-                 hand_brake=False, reverse=False):
-    throttle = np.clip(throttle, 0.0, 1.0)
+                 hand_brake=False, reverse=False,throttle_limit = 1.0):
+    throttle = np.clip(throttle, 0.0, throttle_limit)
     steer = np.clip(steer, -1.0, 1.0)
     brake = np.clip(brake, 0.0, 1.0)
     control = carla.VehicleControl(throttle, steer, brake, hand_brake, reverse)

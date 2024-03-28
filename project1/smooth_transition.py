@@ -66,7 +66,7 @@ class smooth_transition(object):
         return Q
     
     def evaluater_of_HM_intention_similarity(self,torque_machine,torque_human,position_expect,position_real):
-        S = sqrt((fabs(torque_machine) - fabs(torque_human))**2) + sqrt((position_expect - position_real)**2)
+        S = sqrt((fabs(torque_machine) - fabs(torque_human))**2) + 20*sqrt((position_expect - position_real)**2)
         return S 
 
     def func(self,T,T_t,a=12.5,b=0.5):
