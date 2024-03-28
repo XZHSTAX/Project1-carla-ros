@@ -10,6 +10,7 @@ from pygame.locals import K_p
 from configparser import ConfigParser
 from pygame.locals import *
 from project1.MPC import MPCPlusPID
+from project1.pure_pursuit import PurePursuitPlusPID
 import rclpy
 from rclpy.node import Node
 from ros_g29_force_feedback.msg import ForceFeedback
@@ -17,7 +18,9 @@ from std_msgs.msg import Float64
 import threading
 from threading import Thread
 from scipy.signal import butter, lfilter
-
+from project1.smooth_transition import smooth_transition
+from collections import deque
+import csv
 color_bar = [(0,   255,  0 , 0),   # Green  LEFT
              (255, 0,    0 , 0),   # Red    RIGHT
              (0,   0,   0  , 0),   # Black  STRAIGHT
@@ -25,7 +28,7 @@ color_bar = [(0,   255,  0 , 0),   # Green  LEFT
              (0,   0,   255, 0),   # Blue   CHANGELANELEFT
              (255, 255,  0 , 0),   # Yellow CHANGELANERIGHT
              ]
-FPS = 30
+FPS = 37
 plan_fre = 3    # 实际上这里的频率指的是，实际程序运行多少次，mpc规划控制运行一次
 mpc_sample_time = 1./FPS * plan_fre
 
@@ -33,8 +36,9 @@ main_image_shape = (1280, 720)
 driver_real_view = [[0.1, -0.25 ,1.25],[0,0,0]]    # 正常开车视角
 driver_sim_view1 = [[1.25, 0,    1.25],[0,0,0]]    # 模拟视角，前方视角
 driver_sim_view2 = [[-10, 0,     2.8], [-10,0,0]]  # 模拟视角，后看视角
+driver_sim_view3 = [[-5.5, 0,     2.8], [-10,0,0]]  # 模拟视角，后看视角
 
-driver_view = driver_sim_view1
+driver_view = driver_sim_view3
 
 ct_point = carla.Location(-82.68668,4.825,0)
 
@@ -47,6 +51,10 @@ class MainNode(Node):
         self.clock = pygame.time.Clock()
         self.controller_human = Control_with_G29()
         self.controller_machine = MPCPlusPID()
+        self.controller_machine2 = PurePursuitPlusPID()
+        self.use_controller = 2
+
+        self.HSC = smooth_transition()
         self.prepare_wold()
         
         pygame.init()
@@ -63,6 +71,27 @@ class MainNode(Node):
         fs = 1/0.002
         cutoff_freq = 15
         self.LowPassFilter_for_ex_torque =  LowPassFilter(cutoff_freq,fs)
+        self.desired_speed = 15
+        self.alpha = 0
+        self.HM_state = 0
+        self.HSC_color_bar = [(255,255,255),(255, 247, 138),(255, 227, 130),(255, 196, 126),(255, 173, 132)]
+        self.delta_speed = 0
+        self.recorder = {"X":[],
+                         "Y":[],
+                         "Yaw":[],
+                         "Speed":[],
+                         "Torque_machine":[],
+                         "Torque_human":[],
+                         "Steering_angle_machine":[],
+                         "Steering_angle_real":[],
+                         "HM_state":[],
+                         "Time":[],
+                         "Alpha":[],
+                         "Manual_Auto_HSC":[],
+                         }
+        self.old_speed = deque(maxlen=50)
+        self.steering_angle_machine = 0
+        self.Manual_Auto_HSC = 0
 
     def prepare_wold(self):
         self.actor_list = []
@@ -95,7 +124,10 @@ class MainNode(Node):
         self.destination = m.get_spawn_points()[294].location
         self.route,self.agent = autopilot(self.vehicle,self.destination)
         draw_waypoint(self.route,self.world)
-        self.traj = waypoint2traj(self.route,self.vehicle,transform2vehicle=0,contain_yaw=1)
+        if self.use_controller == 1:
+            self.traj = waypoint2traj(self.route,self.vehicle,transform2vehicle=0,contain_yaw=1)
+        elif self.use_controller == 2:
+            self.traj = waypoint2traj(self.route,self.vehicle)
 
     def main_loop(self):
         with CarlaSyncMode(self.world, *self.sensors,fps=FPS) as sync_mode: 
@@ -112,37 +144,69 @@ class MainNode(Node):
                 if self.controller_human.parse_events(self.agent,self.destination): # 如果按下esc键，则直接退出
                     return
                 
-                if self.controller_human._autopilot_enabled:
-                    # 如果使用自动驾驶
-                    if self.plan_count%plan_fre == 0:
-                        traj_object = waypoint2traj(self.route,self.vehicle,transform2vehicle=1,contain_yaw=1)
-                        throttle, steer = self.controller_machine.get_control(self.traj,traj_object, desired_speed=15, dt=mpc_sample_time,state = state)
-                    self.plan_count = self.plan_count + 1
-                    send_control(self.vehicle,throttle,steer,0)
+                if self.controller_human._autopilot_enabled: # 如果使用自动驾驶
+                    if self.use_controller == 1:             # 如果使用控制器1
+                        if self.plan_count%plan_fre == 0:    # 如果到了使用次数
+                            traj_object = waypoint2traj(self.route,self.vehicle,transform2vehicle=1,contain_yaw=1)
+                            throttle, self.steering_angle_machine = self.controller_machine.get_control(self.traj,traj_object, desired_speed=self.desired_speed, dt=mpc_sample_time,state = state)
+                        self.plan_count = self.plan_count + 1
+                    elif self.use_controller == 2:
+                        self.traj = waypoint2traj(self.route,self.vehicle)
+                        throttle, self.steering_angle_machine = self.controller_machine2.get_control(self.traj,speed,desired_speed=self.desired_speed,dt=1./FPS)
+                    self.Manual_Auto_HSC = 1
+
+
+                    send_control(self.vehicle,throttle,self.steering_angle_machine,0)
                     out_msg = ForceFeedback()
-                    out_msg.position = np.clip(steer, -1.0, 1.0)
+                    out_msg.position = np.clip(self.steering_angle_machine, -1.0, 1.0)
                     out_msg.torque = 0.8
                     self.publisher.publish(out_msg)
 
                 elif self.shared_control_transform:
                     # 如果开启平滑过度模式
-                    #TODO: 在此处添加平滑过度逻辑,这里先写一个简单的线性分配：
-                    aplha = 0.5
-                    if self.plan_count%plan_fre == 0:
-                        traj_object = waypoint2traj(self.route,self.vehicle,transform2vehicle=1,contain_yaw=1)
-                        throttle, steer = self.controller_machine.get_control(self.traj,traj_object, desired_speed=15, dt=mpc_sample_time,state = state)
-                    self.plan_count = self.plan_count + 1
-                    send_control(self.vehicle,aplha * self.controller_human._control.throttle + (1- aplha)*throttle,
-                                        aplha * self.controller_human._control.steer + (1- aplha)*steer,
+                    self.alpha,self.HM_state,self.delta_speed = self.HSC.coorinator(speed,
+                                                                    self.external_torque,
+                                                                    out_msg.torque,
+                                                                    self.steering_angle_machine,
+                                                                    self.controller_human._control.steer)
+                    self.desired_speed = self.desired_speed - self.delta_speed
+                    if self.use_controller == 1:
+                        if self.plan_count%plan_fre == 0:
+                            traj_object = waypoint2traj(self.route,self.vehicle,transform2vehicle=1,contain_yaw=1)
+                            throttle, self.steering_angle_machine = self.controller_machine.get_control(self.traj,
+                                                                                traj_object, 
+                                                                                desired_speed=self.desired_speed, 
+                                                                                dt=mpc_sample_time,
+                                                                                state = state)
+                        self.plan_count = self.plan_count + 1
+                    elif self.use_controller == 2:
+                        self.traj = waypoint2traj(self.route,self.vehicle)
+                        throttle, self.steering_angle_machine = self.controller_machine2.get_control(self.traj,speed,desired_speed=self.desired_speed,dt=1./FPS)
+                    
+                    send_control(self.vehicle,throttle,
+                                        self.alpha * self.controller_human._control.steer + (1- self.alpha)*self.steering_angle_machine,
                                         self.controller_human._control.brake,
                                         self.controller_human._control.hand_brake,
-                                        self.controller_human._control.reverse)                     
+                                        self.controller_human._control.reverse)
+                    out_msg = ForceFeedback()
+                    out_msg.position = np.clip(self.alpha * self.controller_human._control.steer + (1- self.alpha)*self.steering_angle_machine, -1.0, 1.0)
+                    out_msg.torque = 1.0 - self.alpha
+                    self.publisher.publish(out_msg)
+                    if self.alpha >= 0.98 :
+                        self.shared_control_transform = 0 
+                    self.Manual_Auto_HSC = 2                    
+                
                 else:# 手动控制
                     send_control(self.vehicle,self.controller_human._control.throttle,
                                         self.controller_human._control.steer,
                                         self.controller_human._control.brake,
                                         self.controller_human._control.hand_brake,
-                                        self.controller_human._control.reverse) 
+                                        self.controller_human._control.reverse)
+                    out_msg = ForceFeedback()
+                    out_msg.position = 0.0
+                    out_msg.torque = 0.3
+                    self.publisher.publish(out_msg)
+                    self.Manual_Auto_HSC = 0
                 
                 snapshot, image_rgb = tick_response
                 image_rgb = copy.copy(carla_img_to_array(image_rgb))
@@ -156,24 +220,139 @@ class MainNode(Node):
                          'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (self.vehicle.get_transform().location.x, self.vehicle.get_transform().location.y)),
                          'Yaw:                       % 3.0f' %self.vehicle.get_transform().rotation.yaw,
                          'external toqure(N·m):      % 3.1f'%self.external_torque,
+                         'Alpha:                     % 3.1f'%self.alpha,
+                         'delta speed:               % 3.1f'%self.delta_speed,
+                         'desired speed:             % 3.1f'%self.desired_speed,
                         ]                
-                display_info(self.display,texts,self.font,self.vehicle,speed,self.font_speed,self.controller_human._autopilot_enabled,dy=18)
+                self.display_info(self.display,texts,self.font,self.vehicle,speed,self.font_speed)
                                 
                 # 如果到达接管触发点，则结束完全自动驾驶，开启
                 if not self.reach_ct_point:
                     if reach_destination(self.vehicle,ct_point,radius=2):
                         self.controller_human._autopilot_enabled = 0
                         self.reach_ct_point = 1
-                        self.shared_control_transform = 0
+                        self.shared_control_transform = 1
                 if reach_destination(self.vehicle,self.destination):
-                    self.controller_human._autopilot_enabled = 0 
+                    self.controller_human._autopilot_enabled = 0
+                self.record_data([state[0], # X
+                                  state[1], # Y
+                                  state[2], # Yaw
+                                  state[3], # Speed
+                                  666,                                   # Torque_machine
+                                  self.external_torque,                  # Torque_human
+                                  self.steering_angle_machine,           # Steering_angle_machine
+                                  self.controller_human._control.steer,  # Steering_angle_real
+                                  self.HM_state,                         # HM_state
+                                  666,                                   # Time
+                                  self.alpha,
+                                  self.Manual_Auto_HSC]) 
+                
+
+    def write_text(self,text,font,display,text_color=(255,0,0),text_location=None):
+        text_surface = font.render(text, True, text_color)
         
+        if not text_location:
+            text_width = text_surface.get_width()
+            text_height = text_surface.get_height()
+            text_x = (main_image_shape[0] - text_width) // 2
+            text_y = (main_image_shape[1] - text_height) // 2
+        else:
+            text_x, text_y = text_location
+
+        display.blit( text_surface, (text_x, 0))
+
+    def draw_progress_bar(self,display,frame_location,frame_size,progress_location,progress_size,frame_color=(255,255,255),progress_color=(255,255,255)):
+        rect_border = pygame.Rect(frame_location, frame_size)
+        pygame.draw.rect(display, frame_color, rect_border, 1)
+
+        rect = pygame.Rect(progress_location, progress_size)
+        pygame.draw.rect(display, progress_color, rect)        
+
+    def display_info(self,display,texts,font,vehicle,speed,font_speed,dy=18):
+        info_surface = pygame.Surface((220, main_image_shape[1]/2))
+        info_surface.set_alpha(100)
+        display.blit(info_surface, (0, 0))    
+        
+        for it,t in enumerate(texts):
+            display.blit(
+                font.render(t, True, (255,255,255)), (5, 20+dy*it))
+        v_offset =  20+dy*it + dy
+
+        display.blit( font.render("Throttle:", True, (255,255,255)), (5, v_offset))
+        # throttle_rate = np.clip(throttle, 0.0, 1.0)
+        throttle_rate = vehicle.get_control().throttle
+        bar_width = 106
+        bar_h_offset = 100
+        self.draw_progress_bar(display,
+                               (bar_h_offset, v_offset+6),
+                               (bar_width, 6),
+                               (bar_h_offset, v_offset+6),
+                               (throttle_rate * bar_width, 6))
+        v_offset = v_offset + dy
+        #---------------------------------------------------------------------------------#
+        display.blit( font.render("Steer:", True, (255,255,255)), (5, v_offset))
+        # steer_rate = np.clip(steer, -1.0, 1.0)
+        steer_rate = vehicle.get_control().steer
+        self.draw_progress_bar(display,
+                               (bar_h_offset, v_offset+6),
+                               (bar_width, 6),
+                               ((bar_h_offset+(steer_rate+1)/2*bar_width), v_offset+6),
+                               (6, 6))
+        v_offset = v_offset + dy
+
+        if all(speed > x for x in self.old_speed):
+            Speed_color = (255, 105, 105)
+        elif all(speed < x for x in self.old_speed):
+            Speed_color = (0, 0, 255)
+        else:
+            Speed_color = (255,255,255)
+        self.old_speed.append(speed)
+        speed_str = "%4.1fkm/h" %(speed*3.6)
+        display.blit( font_speed.render(speed_str, True, Speed_color), (main_image_shape[0]-400,main_image_shape[1]-90) )
+        
+        
+        if self.controller_human._autopilot_enabled:
+            autopilot_on_str = "Auto"
+            self.write_text(autopilot_on_str,font_speed,display)
+        elif self.shared_control_transform:
+            HSC_str = "HSC %s"%self.HM_state
+            self.write_text(HSC_str,font_speed,display,self.HSC_color_bar[self.HM_state])           
+            bar_width = 800
+            bar_h_offset = 500
+            bar_location_x = (main_image_shape[0] - bar_width)// 2
+            bar_height = 25
+            self.draw_progress_bar(display,
+                                (bar_location_x, 100),
+                                (bar_width, bar_height),
+                                (bar_location_x, 100),
+                                (self.alpha * bar_width, bar_height),
+                                progress_color=self.HSC_color_bar[self.HM_state]) 
+        else:
+            autopilot_off_str = "Auto OFF"
+            self.write_text(autopilot_off_str,font_speed,display)
+
+        pygame.display.flip() # 将绘制的图像显示在屏幕上  
+
     def listener_callback(self,msg):
         external_torque_filted = self.LowPassFilter_for_ex_torque.filter(msg.data)
         self.external_torque = external_torque_filted
 
     def spin(self):
             rclpy.spin(self, self.executor)
+            
+    def record_data(self,data_list):
+        self.recorder["X"].append(data_list[0])
+        self.recorder["Y"].append(data_list[1])
+        self.recorder["Yaw"].append(data_list[2])
+        self.recorder["Speed"].append(data_list[3])
+        self.recorder["Torque_machine"].append(data_list[4])
+        self.recorder["Torque_human"].append(data_list[5])
+        self.recorder["Steering_angle_machine"].append(data_list[6])
+        self.recorder["Steering_angle_real"].append(data_list[7])
+        self.recorder["HM_state"].append(data_list[8])
+        self.recorder["Time"].append(data_list[9])
+        self.recorder["Alpha"].append(data_list[10])
+        self.recorder["Manual_Auto_HSC"].append(data_list[11])
 
 
 class Control_with_G29(object):
@@ -307,59 +486,6 @@ def draw_waypoint(route,world):
                            carla.Location(x,y,z+5),
                            arrow_size=0.5,)  
 
-def display_info(display,texts,font,vehicle,speed,font_speed,autopilot_on,dy=18):
-    info_surface = pygame.Surface((220, main_image_shape[1]/4))
-    info_surface.set_alpha(100)
-    display.blit(info_surface, (0, 0))    
-    
-    for it,t in enumerate(texts):
-        display.blit(
-            font.render(t, True, (255,255,255)), (5, 20+dy*it))
-    
-    v_offset =  20+dy*it + dy
-    display.blit( font.render("Throttle:", True, (255,255,255)), (5, v_offset))
-
-    
-    # throttle_rate = np.clip(throttle, 0.0, 1.0)
-    throttle_rate = vehicle.get_control().throttle
-    bar_width = 106
-    bar_h_offset = 100
-    rect_border = pygame.Rect((bar_h_offset, v_offset+6), (bar_width, 6))
-    pygame.draw.rect(display, (255, 255, 255), rect_border, 1)
-
-    rect = pygame.Rect((bar_h_offset, v_offset+6), (throttle_rate * bar_width, 6))
-    pygame.draw.rect(display, (255, 255, 255), rect)
-
-    v_offset = v_offset + dy
-
-    display.blit( font.render("Steer:", True, (255,255,255)), (5, v_offset))
-    # steer_rate = np.clip(steer, -1.0, 1.0)
-    steer_rate = vehicle.get_control().steer
-    bar_width = 106
-    bar_h_offset = 100
-    rect_border = pygame.Rect((bar_h_offset, v_offset+6), (bar_width, 6))
-    pygame.draw.rect(display, (255, 255, 255), rect_border, 1)
-
-    rect = pygame.Rect(((bar_h_offset+(steer_rate+1)/2*bar_width), v_offset+6), (6, 6))
-    pygame.draw.rect(display, (255, 255, 255), rect)
-
-    speed_str = "%4.1fkm/h" %(speed*3.6)
-    display.blit( font_speed.render(speed_str, True, (255,255,255)), (main_image_shape[0]-400,main_image_shape[1]-90) )
-    if autopilot_on:
-        autopilot_on_str = "Auto"
-        display.blit( font_speed.render(autopilot_on_str, True, (255,0,0)), (10,main_image_shape[1]-90 ))
-    else:
-        autopilot_off_str = "AutoPilot OFF!!!"
-        text_surface = font_speed.render(autopilot_off_str, True, (255,0,0))
-        text_width = text_surface.get_width()
-        text_height = text_surface.get_height()
-        text_x = (main_image_shape[0] - text_width) // 2
-        text_y = (main_image_shape[1] - text_height) // 2
-        display.blit( text_surface, (text_x, 0))
-
-
-    pygame.display.flip() # 将绘制的图像显示在屏幕上  
-
 def carla_vec_to_np_array(vec):
     return np.array([vec.x,
                      vec.y,
@@ -452,6 +578,14 @@ def main(args=None):
         spin_thread.start()
         main_node.main_loop()
     finally:
+        field_names = list(main_node.recorder.keys())
+        rows = zip(*main_node.recorder.values())
+        with open('recoder_data.csv', 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(field_names)
+            for row in rows:
+                writer.writerow(row)
+
         print('destroying actors.')
         for actor in main_node.actor_list:
             actor.destroy()
